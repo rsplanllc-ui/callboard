@@ -193,12 +193,63 @@ button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
     if (o.ch === "uber" || o.ch === "doordash") return [nm || cd, nm ? cd : ""];
     return [nm, ""];
   }
-  function speechText(o){
-    var nm = trim(o.nm), cd = trim(o.cd);
-    if (o.ch === "panda") return "Hungry Panda order " + cd.split("").join(" ") + " is ready";
-    if (o.ch === "uber") return "Uber Eats, " + (nm || cd) + ", your order is ready";
-    if (o.ch === "doordash") return "DoorDash, " + (nm || cd) + ", your order is ready";
-    return "Order number " + o.n + " is ready";
+  /* ---------- 像真人一样的播报说法 ----------
+     ① 每次随机换说法，不连续重复同一句；② 1–2 秒内一起出餐的堂食/线上/kiosk 单合并成一句（最多 3 个号）；
+     ③ 出餐 3 分钟还在屏上、本次开机播报过的单，再提醒一次（只提醒一次，排在新单后面）；
+     ④ 偶尔加一句结尾（Enjoy! / 按时段问候）。熊猫单号逐位念。 */
+  var SAY = {
+    one: ["Order number {n} is ready", "Number {n}, your order is ready", "{n}, your drinks are ready",
+          "Order {n}, ready for pickup", "Number {n}, come and grab it!", "Order {n}, your drinks are ready at the counter"],
+    many: ["Orders {list} are ready", "Numbers {list}, your drinks are ready", "{list}, ready for pickup",
+           "Orders {list}, come and grab them!"],
+    panda: ["Hungry Panda order {d} is ready", "Hungry Panda, order {d}, ready for pickup", "Hungry Panda {d}, your order is ready"],
+    plat: ["{p}, {nm}, your order is ready", "{p} order for {nm} is ready", "{nm} from {p}, your order is ready for pickup"],
+    remindOne: ["Order {n}, your drinks are still waiting for you", "Number {n}, just a reminder, your order is ready",
+                "{n}, your drinks are waiting at the counter"],
+    remindPanda: ["Hungry Panda {d}, your order is still waiting", "Hungry Panda order {d}, just a reminder, it's ready"],
+    remindPlat: ["{p}, {nm}, your order is still waiting at the counter", "{nm} from {p}, just a reminder, your order is ready"]
+  };
+  var lastPick = Object.create(null);
+  function pick(kind){
+    var arr = SAY[kind], i = Math.floor(Math.random() * arr.length);
+    if (arr.length > 1 && i === lastPick[kind]) i = (i + 1 + Math.floor(Math.random() * (arr.length - 1))) % arr.length;
+    lastPick[kind] = i; return arr[i];
+  }
+  function fill(t, v){ return t.replace(/\{(\w+)\}/g, function(_, k){ return v[k] == null ? "" : v[k]; }); }
+  function listWords(ns){ return ns.length === 1 ? ns[0] : ns.slice(0, -1).join(", ") + " and " + ns[ns.length - 1]; }
+  function withTail(t){ var x = tail(); return x ? t.replace(/[.!]?$/, function(m){ return m || "."; }) + x : t; }
+  function tail(){
+    if (Math.random() > .25) return "";
+    var h = new Date().getHours();
+    var t = [" Enjoy!", " Thank you!", h < 12 ? " Have a great morning!" : h < 17 ? " Have a great afternoon!" : " Have a lovely evening!"];
+    return t[Math.floor(Math.random() * t.length)];
+  }
+  function platVars(o){
+    var nm = trim(o.nm) || trim(o.cd);
+    return { p: o.ch === "uber" ? "Uber Eats" : "DoorDash", nm: nm };
+  }
+  function lineFor(o, remind){
+    if (o.ch === "panda") return fill(pick(remind ? "remindPanda" : "panda"), { d: trim(o.cd).split("").join(" ") });
+    if (o.ch === "uber" || o.ch === "doordash") return fill(pick(remind ? "remindPlat" : "plat"), platVars(o));
+    return fill(pick(remind ? "remindOne" : "one"), { n: o.n });
+  }
+  // 一批新出餐的单 -> 若干句话（按出餐先后）
+  function linesFor(batch){
+    var out = [], nums = [];
+    function flushNums(){
+      for (var i = 0; i < nums.length; i += 3) {
+        var g = nums.slice(i, i + 3);
+        out.push({ key: "n:" + g.map(function(o){ return o.g; }).join(","),
+                   text: withTail(g.length === 1 ? lineFor(g[0]) : fill(pick("many"), { list: listWords(g.map(function(o){ return o.n; })) })) });
+      }
+      nums = [];
+    }
+    batch.forEach(function(o){
+      if (o.ch === "panda" || o.ch === "uber" || o.ch === "doordash") { flushNums(); out.push({ key: "n:" + o.g, text: withTail(lineFor(o)) }); }
+      else nums.push(o);
+    });
+    flushNums();
+    return out;
   }
 
   /* ---------- scaling ---------- */
@@ -279,8 +330,9 @@ button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
   /* ---------- voice ---------- */
   // 稳定性：① 服务端不再只给最早 30 单，新出餐的单一定能被发现；② Chrome 的语音有时不触发 onend，
   // 以前队列会永远卡住（之后全部不报）——现在每条有看门狗超时，卡住就 cancel 并继续下一条；
-  // ③ 保留当前 utterance 引用，避免被回收后 onend 丢失；④ 队列上限 8 条，批量出餐时丢最旧的（屏幕上仍显示）。
+  // ③ 保留当前 utterance 引用，避免被回收后 onend 丢失；④ 队列上限 8 句，超了先丢提醒、再丢最早的（屏幕上仍显示）。
   var sayQ = [], speaking = null, sayDog = null, voice = null, SAY_MAX = 8;
+  var REMIND_S = 180, announced = Object.create(null), reminded = Object.create(null), pending = [], pendTimer = null, lastRemindAt = 0;
   function pickVoice(){
     if (!("speechSynthesis" in window)) return;
     var vs = speechSynthesis.getVoices().filter(function(v){ return /^en(-|_)US/i.test(v.lang); });
@@ -289,22 +341,29 @@ button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
     if (!voice) voice = vs[0] || null;
   }
   if ("speechSynthesis" in window) { pickVoice(); speechSynthesis.onvoiceschanged = pickVoice; }
-  function say(text){
+  // item = { key, text, low }；提醒(low)永远排在新单后面
+  function say(item){
+    if (typeof item === "string") item = { key: item, text: item };
     if (!voiceOn || !("speechSynthesis" in window)) return;
-    if (sayQ.indexOf(text) !== -1) return;
-    sayQ.push(text);
-    while (sayQ.length > SAY_MAX) sayQ.shift();
+    if (sayQ.some(function(x){ return x.key === item.key; })) return;
+    if (item.low) sayQ.push(item);
+    else { var i = 0; while (i < sayQ.length && !sayQ[i].low) i++; sayQ.splice(i, 0, item); }
+    // 超过上限：先丢提醒，没有提醒就丢最早的新单（屏幕上仍显示）
+    while (sayQ.length > SAY_MAX) {
+      var j = -1; for (var k = sayQ.length - 1; k >= 0; k--) if (sayQ[k].low) { j = k; break; }
+      sayQ.splice(j >= 0 ? j : 0, 1);
+    }
     if (!speaking) next();
   }
   function done(u){
     if (speaking !== u) return;
     clearTimeout(sayDog); speaking = null;
-    setTimeout(next, 500);
+    setTimeout(next, 600 + Math.random() * 1000);   // 句与句之间停顿长短随机
   }
   function next(){
     if (speaking || !sayQ.length) return;
-    var text = sayQ.shift();
-    var u = new SpeechSynthesisUtterance(text); u.lang = "en-US"; u.rate = .92; if (voice) u.voice = voice;
+    var text = sayQ.shift().text;
+    var u = new SpeechSynthesisUtterance(text); u.lang = "en-US"; u.rate = .88 + Math.random() * .1; u.pitch = .96 + Math.random() * .1; if (voice) u.voice = voice;
     speaking = u;
     u.onend = u.onerror = function(){ done(u); };
     clearTimeout(sayDog);
@@ -323,6 +382,20 @@ button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
     say("Voice announcements on");
   });
 
+  // 出餐满 3 分钟还没取：提醒一次。只提醒本次开机播报过的单；队列空闲时才报，两次提醒至少隔 20 秒
+  function remindCheck(list){
+    if (!voiceOn || speaking || sayQ.length || Date.now() - lastRemindAt < 20000) return;
+    var now = Date.now() + counter.skew;
+    for (var i = list.length - 1; i >= 0; i--) {
+      var o = list[i];
+      if (announced[o.g] && !reminded[o.g] && (now - Date.parse(o.s)) / 1000 >= REMIND_S) {
+        reminded[o.g] = 1; lastRemindAt = Date.now();
+        say({ key: "r:" + o.g, text: lineFor(o, true), low: true });
+        return;
+      }
+    }
+  }
+
   /* ---------- data ---------- */
   function get(viewName){
     var ctl = ("AbortController" in window) ? new AbortController() : null;
@@ -340,8 +413,17 @@ button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
       var list = b.ready || [];
       if (!firstBoard) {
         var fresh = list.filter(function(o){ return !seen[o.g]; });
-        fresh.slice().reverse().forEach(function(o){ say(speechText(o)); });
-        if (fresh.length) { page = 0; pageAt = Date.now(); }
+        if (fresh.length) {
+          page = 0; pageAt = Date.now();
+          pending = pending.concat(fresh.slice().reverse());   // 按出餐先后
+          // 稍等 1–2 秒再报，让同时出餐的单能合并成一句
+          if (!pendTimer) pendTimer = setTimeout(function(){
+            pendTimer = null; var b = pending; pending = [];
+            b.forEach(function(o){ announced[o.g] = Date.now(); });
+            linesFor(b).forEach(say);
+          }, 1000 + Math.random() * 1000);
+        }
+        remindCheck(list);
       }
       board.list = list;
       if (view === "tv") renderTV();
