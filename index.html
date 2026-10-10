@@ -191,7 +191,7 @@ button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
     var nm = trim(o.nm), cd = trim(o.cd);
     if (o.ch === "panda") return [cd || "", ""];
     if (o.ch === "uber" || o.ch === "doordash") return [nm || cd, nm ? cd : ""];
-    return [nm, ""];
+    return [Array.from(nm).slice(0, 5).join(""), ""];   // 库里存完整名字（语音要用），屏幕只显示前 5 个字
   }
   /* ---------- 像真人一样的播报说法 ----------
      ① 每次随机换说法，不连续重复同一句；② 1–2 秒内一起出餐的堂食/线上/kiosk 单合并成一句（最多 3 个号）；
@@ -204,6 +204,10 @@ button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
            "Orders {list}, come and grab them!"],
     panda: ["Hungry Panda order {d} is ready", "Hungry Panda, order {d}, ready for pickup", "Hungry Panda {d}, your order is ready"],
     plat: ["{p}, {nm}, your order is ready", "{p} order for {nm} is ready", "{nm} from {p}, your order is ready for pickup"],
+    // 有名字的堂食/线上/kiosk 单：句子是英文，名字是中文就用中文声音念名字
+    named: ["{nm}, order {n} is ready", "Order {n} for {nm}, ready for pickup", "{nm}, number {n}, your drinks are ready",
+            "Order {n}, {nm}, come and grab it!"],
+    remindNamed: ["{nm}, order {n}, your drinks are still waiting for you", "Order {n} for {nm}, just a reminder, it's ready"],
     remindOne: ["Order {n}, your drinks are still waiting for you", "Number {n}, just a reminder, your order is ready",
                 "{n}, your drinks are waiting at the counter"],
     remindPanda: ["Hungry Panda {d}, your order is still waiting", "Hungry Panda order {d}, just a reminder, it's ready"],
@@ -229,7 +233,11 @@ button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
     return w2(hi) + " " + (lo < 10 ? "oh " + ONES[lo] : w2(lo));
   }
   function digitWords(x){ return String(x == null ? "" : x).replace(/\D/g, "").split("").map(function(d){ return ONES[+d]; }).join(" "); }
-  function fill(t, v){ return t.replace(/\{(\w+)\}/g, function(_, k){ return v[k] == null ? "" : v[k]; }); }
+  // 名字前后加 \u0001 标记，播报时拆成单独一段，按名字的语言选声音
+  function fill(t, v){ return t.replace(/\{(\w+)\}/g, function(_, k){ return v[k] == null ? "" : k === "nm" ? "\u0001" + v[k] + "\u0001" : v[k]; }); }
+  var CJK = /[\u3400-\u9fff\uf900-\ufaff]/;
+  // 能念的名字：去掉空白后有内容、不含数字（排除「Table 5」这类）
+  function speakName(o){ var nm = trim(o.nm); return nm && !/\d/.test(nm) ? nm : ""; }
   function listWords(ns){ return ns.length === 1 ? ns[0] : ns.slice(0, -1).join(", ") + " and " + ns[ns.length - 1]; }
   function withTail(t){ var x = tail(); return x ? t.replace(/[.!]?$/, function(m){ return m || "."; }) + x : t; }
   function tail(){
@@ -239,12 +247,14 @@ button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
     return t[Math.floor(Math.random() * t.length)];
   }
   function platVars(o){
-    var nm = trim(o.nm) || trim(o.cd);
+    var nm = trim(o.nm) || digitWords(o.cd) || trim(o.cd);
     return { p: o.ch === "uber" ? "Uber Eats" : "DoorDash", nm: nm };
   }
   function lineFor(o, remind){
     if (o.ch === "panda") return fill(pick(remind ? "remindPanda" : "panda"), { d: digitWords(o.cd) });
     if (o.ch === "uber" || o.ch === "doordash") return fill(pick(remind ? "remindPlat" : "plat"), platVars(o));
+    var nm = speakName(o);
+    if (nm) return fill(pick(remind ? "remindNamed" : "named"), { n: numWords(o.n), nm: nm });
     return fill(pick(remind ? "remindOne" : "one"), { n: numWords(o.n) });
   }
   // 一批新出餐的单 -> 若干句话（按出餐先后）
@@ -259,7 +269,8 @@ button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
       nums = [];
     }
     batch.forEach(function(o){
-      if (o.ch === "panda" || o.ch === "uber" || o.ch === "doordash") { flushNums(); out.push({ key: "n:" + o.g, text: withTail(lineFor(o)) }); }
+      // 有名字的单各报各的（要念名字），没名字的才合并
+      if (o.ch === "panda" || o.ch === "uber" || o.ch === "doordash" || speakName(o)) { flushNums(); out.push({ key: "n:" + o.g, text: withTail(lineFor(o)) }); }
       else nums.push(o);
     });
     flushNums();
@@ -350,13 +361,27 @@ button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
   // 一定要选到英文声音：系统是中文时默认声音是中文（如「婷婷」），会把数字念成中文。
   // 有的浏览器（Safari / 部分电视）页面打开时声音列表还是空的，所以每次播报前都会再选一次。
   var NOVELTY = /Albert|Bad News|Bahh|Bells|Boing|Bubbles|Cellos|Good News|Jester|Organ|Superstar|Trinoids|Whisper|Wobble|Zarvox|Junior|Ralph|Fred|Grandma|Grandpa|Rocko|Eddy|Flo|Reed|Sandy|Shelley/i;
+  // 声音卡顿：Google 的在线声音（Google US English / Google 普通话）走网络，容易断断续续，所以优先用本机声音。
+  function choose(list, pref){
+    var local = list.filter(function(v){ return v.localService; }), pools = [local, list];
+    for (var p = 0; p < pools.length; p++)
+      for (var i = 0; i < pref.length; i++) { var hit = pools[p].filter(function(v){ return pref[i].test(v.name); })[0]; if (hit) return hit; }
+    return local[0] || list[0] || null;
+  }
+  var zhVoice = null;
   function pickVoice(){
-    if (voice || !("speechSynthesis" in window)) return;
-    var all = speechSynthesis.getVoices().filter(function(v){ return /^en/i.test(v.lang) && !NOVELTY.test(v.name); });
-    var us = all.filter(function(v){ return /^en(-|_)US/i.test(v.lang); });
-    var pref = [/Google US English/i, /Samantha/i, /Ava/i, /Allison|Susan|Zoe/i, /Aria|Jenny|Guy/i, /Natural/i, /Alex/i];
-    for (var i = 0; i < pref.length && !voice; i++) voice = us.filter(function(v){ return pref[i].test(v.name); })[0] || null;
-    if (!voice) voice = us[0] || all[0] || null;
+    if (!("speechSynthesis" in window)) return;
+    var vs = speechSynthesis.getVoices();
+    if (!voice) {
+      var en = vs.filter(function(v){ return /^en/i.test(v.lang) && !NOVELTY.test(v.name); });
+      var us = en.filter(function(v){ return /^en(-|_)US/i.test(v.lang); });
+      voice = choose(us.length ? us : en, [/Samantha/i, /Ava/i, /Allison|Susan|Zoe/i, /Aria|Jenny|Guy/i, /Natural/i, /Alex/i, /Google US English/i]);
+    }
+    if (!zhVoice) {
+      var zh = vs.filter(function(v){ return /^zh/i.test(v.lang); });
+      var cn = zh.filter(function(v){ return /^zh(-|_)CN/i.test(v.lang); });
+      zhVoice = choose(cn.length ? cn : zh, [/Tingting|婷婷/i, /Lili|莉莉/i, /Yu-?shu|语舒/i, /Xiaoxiao|Yunxi|Natural/i, /Google/i]);
+    }
   }
   if ("speechSynthesis" in window) { pickVoice(); speechSynthesis.onvoiceschanged = pickVoice; }
   // item = { key, text, low }；提醒(low)永远排在新单后面
@@ -382,12 +407,28 @@ button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
     if (speaking || !sayQ.length) return;
     var text = sayQ.shift().text;
     pickVoice();
-    var u = new SpeechSynthesisUtterance(text); u.lang = voice ? voice.lang : "en-US"; u.rate = .88 + Math.random() * .1; u.pitch = .96 + Math.random() * .1; if (voice) u.voice = voice;
+    // 拆段：英文句子用英文声音，中文名字用中文声音；一句话里的几段连着念，最后一段念完才算结束
+    // 英文名直接并在英文句子里一口气念完；只有中文名才单独用中文声音念（换声音会有一点点停顿）
+    var rate = .9 + Math.random() * .06, segs = [], us = [];
+    text.split("\u0001").forEach(function(t, i){
+      var zh = i % 2 === 1 && CJK.test(t), last = segs[segs.length - 1];
+      if (!zh && last && !last.zh) last.t += t; else segs.push({ t: t, zh: zh });
+    });
+    segs.forEach(function(sg){
+      var t = sg.t.replace(/^[\s,]+/, "").replace(/\s+/g, " ").trim();
+      if (!t) return;
+      var v = sg.zh ? zhVoice : voice;
+      var u = new SpeechSynthesisUtterance(t); u.lang = v ? v.lang : (sg.zh ? "zh-CN" : "en-US"); u.rate = sg.zh ? 1 : rate; if (v) u.voice = v;
+      us.push(u);
+    });
+    if (!us.length) { setTimeout(next, 0); return; }
+    var u = us[us.length - 1];
     speaking = u;
-    u.onend = u.onerror = function(){ done(u); };
+    us.forEach(function(x){ x.onerror = function(){ done(u); }; });
+    u.onend = function(){ done(u); };
     clearTimeout(sayDog);
     sayDog = setTimeout(function(){ try { speechSynthesis.cancel(); } catch (_) {} done(u); }, 8000 + text.length * 150);
-    try { if (speechSynthesis.paused) speechSynthesis.resume(); speechSynthesis.speak(u); } catch (_) { done(u); }
+    try { if (speechSynthesis.paused) speechSynthesis.resume(); us.forEach(function(x){ speechSynthesis.speak(x); }); } catch (_) { done(u); }
   }
   // 保活：引擎暂停或卡住时恢复
   setInterval(function(){
