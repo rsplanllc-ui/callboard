@@ -177,7 +177,7 @@ button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
   var board = { list: [], at: 0, err: null }, counter = { todo: [], ready: [], at: 0, skew: 0 };
   var seen = Object.create(null), firstBoard = true, hidden = Object.create(null);
   var voiceOn = false, undoBuf = null, undoTimer = null;
-  var page = 0, pageAt = Date.now(), lastPageShown = -1;
+  var page = 0, pageAt = Date.now(), lastPageShown = -1, lastGridHTML = "";
 
   function esc(s){ return String(s == null ? "" : s).replace(/[&<>"]/g, function(c){ return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]; }); }
   function trim(s){ return String(s == null ? "" : s).trim(); }
@@ -215,6 +215,20 @@ button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
     if (arr.length > 1 && i === lastPick[kind]) i = (i + 1 + Math.floor(Math.random() * (arr.length - 1))) % arr.length;
     lastPick[kind] = i; return arr[i];
   }
+  // 数字转成英文单词再交给语音，这样不管用哪个声音都念英文：767 -> "seven sixty-seven"，105 -> "one oh five"
+  var ONES = ["zero","one","two","three","four","five","six","seven","eight","nine","ten","eleven","twelve","thirteen","fourteen","fifteen","sixteen","seventeen","eighteen","nineteen"];
+  var TENS = ["","","twenty","thirty","forty","fifty","sixty","seventy","eighty","ninety"];
+  function w2(n){ return n < 20 ? ONES[n] : TENS[Math.floor(n / 10)] + (n % 10 ? "-" + ONES[n % 10] : ""); }
+  function numWords(x){
+    x = String(x == null ? "" : x).trim();
+    if (!/^\d{1,4}$/.test(x)) return x;
+    var n = parseInt(x, 10);
+    if (n < 100) return w2(n);
+    var hi = Math.floor(n / 100), lo = n % 100;
+    if (lo === 0) return n % 1000 === 0 ? ONES[n / 1000] + " thousand" : w2(hi) + " hundred";
+    return w2(hi) + " " + (lo < 10 ? "oh " + ONES[lo] : w2(lo));
+  }
+  function digitWords(x){ return String(x == null ? "" : x).replace(/\D/g, "").split("").map(function(d){ return ONES[+d]; }).join(" "); }
   function fill(t, v){ return t.replace(/\{(\w+)\}/g, function(_, k){ return v[k] == null ? "" : v[k]; }); }
   function listWords(ns){ return ns.length === 1 ? ns[0] : ns.slice(0, -1).join(", ") + " and " + ns[ns.length - 1]; }
   function withTail(t){ var x = tail(); return x ? t.replace(/[.!]?$/, function(m){ return m || "."; }) + x : t; }
@@ -229,9 +243,9 @@ button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
     return { p: o.ch === "uber" ? "Uber Eats" : "DoorDash", nm: nm };
   }
   function lineFor(o, remind){
-    if (o.ch === "panda") return fill(pick(remind ? "remindPanda" : "panda"), { d: trim(o.cd).split("").join(" ") });
+    if (o.ch === "panda") return fill(pick(remind ? "remindPanda" : "panda"), { d: digitWords(o.cd) });
     if (o.ch === "uber" || o.ch === "doordash") return fill(pick(remind ? "remindPlat" : "plat"), platVars(o));
-    return fill(pick(remind ? "remindOne" : "one"), { n: o.n });
+    return fill(pick(remind ? "remindOne" : "one"), { n: numWords(o.n) });
   }
   // 一批新出餐的单 -> 若干句话（按出餐先后）
   function linesFor(batch){
@@ -240,7 +254,7 @@ button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
       for (var i = 0; i < nums.length; i += 3) {
         var g = nums.slice(i, i + 3);
         out.push({ key: "n:" + g.map(function(o){ return o.g; }).join(","),
-                   text: withTail(g.length === 1 ? lineFor(g[0]) : fill(pick("many"), { list: listWords(g.map(function(o){ return o.n; })) })) });
+                   text: withTail(g.length === 1 ? lineFor(g[0]) : fill(pick("many"), { list: listWords(g.map(function(o){ return numWords(o.n); })) })) });
       }
       nums = [];
     }
@@ -275,7 +289,7 @@ button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
     });
     for (var i = list.length; i < MAX; i++) html += '<div class="slot" aria-hidden="true"></div>';
     var grid = $("grid");
-    grid.innerHTML = html;
+    if (html !== lastGridHTML) { grid.innerHTML = html; lastGridHTML = html; }   // 内容没变就不重画，电视上更流畅
     var key = page + "/" + pages;
     if (key !== lastPageShown) {
       if (pages > 1 && lastPageShown !== -1) { grid.classList.remove("flip"); void grid.offsetWidth; grid.classList.add("flip"); }
@@ -333,12 +347,16 @@ button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
   // ③ 保留当前 utterance 引用，避免被回收后 onend 丢失；④ 队列上限 8 句，超了先丢提醒、再丢最早的（屏幕上仍显示）。
   var sayQ = [], speaking = null, sayDog = null, voice = null, SAY_MAX = 8;
   var REMIND_S = 180, announced = Object.create(null), reminded = Object.create(null), pending = [], pendTimer = null, lastRemindAt = 0;
+  // 一定要选到英文声音：系统是中文时默认声音是中文（如「婷婷」），会把数字念成中文。
+  // 有的浏览器（Safari / 部分电视）页面打开时声音列表还是空的，所以每次播报前都会再选一次。
+  var NOVELTY = /Albert|Bad News|Bahh|Bells|Boing|Bubbles|Cellos|Good News|Jester|Organ|Superstar|Trinoids|Whisper|Wobble|Zarvox|Junior|Ralph|Fred|Grandma|Grandpa|Rocko|Eddy|Flo|Reed|Sandy|Shelley/i;
   function pickVoice(){
-    if (!("speechSynthesis" in window)) return;
-    var vs = speechSynthesis.getVoices().filter(function(v){ return /^en(-|_)US/i.test(v.lang); });
-    var pref = [/Google US English/i, /Samantha/i, /Natural/i, /Aria|Jenny|Guy/i];
-    for (var i = 0; i < pref.length && !voice; i++) voice = vs.filter(function(v){ return pref[i].test(v.name); })[0] || null;
-    if (!voice) voice = vs[0] || null;
+    if (voice || !("speechSynthesis" in window)) return;
+    var all = speechSynthesis.getVoices().filter(function(v){ return /^en/i.test(v.lang) && !NOVELTY.test(v.name); });
+    var us = all.filter(function(v){ return /^en(-|_)US/i.test(v.lang); });
+    var pref = [/Google US English/i, /Samantha/i, /Ava/i, /Allison|Susan|Zoe/i, /Aria|Jenny|Guy/i, /Natural/i, /Alex/i];
+    for (var i = 0; i < pref.length && !voice; i++) voice = us.filter(function(v){ return pref[i].test(v.name); })[0] || null;
+    if (!voice) voice = us[0] || all[0] || null;
   }
   if ("speechSynthesis" in window) { pickVoice(); speechSynthesis.onvoiceschanged = pickVoice; }
   // item = { key, text, low }；提醒(low)永远排在新单后面
@@ -363,11 +381,12 @@ button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
   function next(){
     if (speaking || !sayQ.length) return;
     var text = sayQ.shift().text;
-    var u = new SpeechSynthesisUtterance(text); u.lang = "en-US"; u.rate = .88 + Math.random() * .1; u.pitch = .96 + Math.random() * .1; if (voice) u.voice = voice;
+    pickVoice();
+    var u = new SpeechSynthesisUtterance(text); u.lang = voice ? voice.lang : "en-US"; u.rate = .88 + Math.random() * .1; u.pitch = .96 + Math.random() * .1; if (voice) u.voice = voice;
     speaking = u;
     u.onend = u.onerror = function(){ done(u); };
     clearTimeout(sayDog);
-    sayDog = setTimeout(function(){ try { speechSynthesis.cancel(); } catch (_) {} done(u); }, 4000 + text.length * 120);
+    sayDog = setTimeout(function(){ try { speechSynthesis.cancel(); } catch (_) {} done(u); }, 8000 + text.length * 150);
     try { if (speechSynthesis.paused) speechSynthesis.resume(); speechSynthesis.speak(u); } catch (_) { done(u); }
   }
   // 保活：引擎暂停或卡住时恢复
