@@ -257,7 +257,7 @@ button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
   addEventListener("resize", fit); fit();
 
   /* ---------- TV ---------- */
-  // 最新出餐排最前（服务端已按出餐时间倒序）。超过 30 单才翻页，每页停 7 秒。
+  // 号码从大到小（服务端已排好）。超过 30 单才翻页，每页停 7 秒。
   function renderTV(){
     var all = board.list.filter(function(o){ return !hidden[o.g]; }), html = "", now = Date.now() + counter.skew;
     var pages = Math.max(1, Math.ceil(all.length / MAX));
